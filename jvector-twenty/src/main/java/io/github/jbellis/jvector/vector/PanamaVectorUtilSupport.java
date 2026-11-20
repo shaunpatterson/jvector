@@ -41,6 +41,13 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
     static final IntVector BYTE_TO_INT_MASK_512 = IntVector.broadcast(IntVector.SPECIES_512, 0xff);
     static final IntVector BYTE_TO_INT_MASK_256 = IntVector.broadcast(IntVector.SPECIES_256, 0xff);
 
+    /**
+     * Minimum vector length (in elements) at which the cosine and squareDistance kernels switch to their two-way
+     * unrolled implementations. On shorter vectors the unrolled form measured slower (64-128 dimensions), with
+     * break-even near 200 on the machine it was tuned on.
+     */
+    static final int UNROLL_MIN_LENGTH = 192;
+
     static final ThreadLocal<int[]> scratchInt512 = ThreadLocal.withInitial(() -> new int[IntVector.SPECIES_512.length()]);
     static final ThreadLocal<int[]> scratchInt256 = ThreadLocal.withInitial(() -> new int[IntVector.SPECIES_256.length()]);
 
@@ -310,6 +317,10 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
             throw new IllegalArgumentException("Vectors must have the same length");
         }
 
+        if (v1.length() >= UNROLL_MIN_LENGTH) {
+            return cosineUnrolled(v1, 0, v2, 0, v1.length());
+        }
+
         var vsum = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
         var vaMagnitude = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
         var vbMagnitude = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
@@ -340,6 +351,9 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
 
     @Override
     public float cosine(VectorFloat<?> v1, int v1offset, VectorFloat<?> v2, int v2offset, int length) {
+        if (length >= UNROLL_MIN_LENGTH) {
+            return cosineUnrolled(v1, v1offset, v2, v2offset, length);
+        }
         var vsum = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
         var vaMagnitude = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
         var vbMagnitude = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
@@ -357,6 +371,55 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
         float bMagnitude = vbMagnitude.reduceLanes(VectorOperators.ADD);
 
         for (int i = vectorizedLength; i < length; i++) {
+            sum += v1.get(v1offset + i) * v2.get(v2offset + i);
+            aMagnitude += v1.get(v1offset + i) * v1.get(v1offset + i);
+            bMagnitude += v2.get(v2offset + i) * v2.get(v2offset + i);
+        }
+
+        return (float) (sum / Math.sqrt(aMagnitude * bMagnitude));
+    }
+
+    /**
+     * Two-way unrolled variant of {@link #cosine(VectorFloat, int, VectorFloat, int, int)} for long vectors: six
+     * independent accumulator chains instead of three. With one chain per quantity the loop is bound by FMA latency
+     * rather than by load/FMA throughput whenever the vectors are cache-resident.
+     */
+    private float cosineUnrolled(VectorFloat<?> v1, int v1offset, VectorFloat<?> v2, int v2offset, int length) {
+        final int step = FloatVector.SPECIES_PREFERRED.length();
+        final int vectorizedLength = FloatVector.SPECIES_PREFERRED.loopBound(length);
+        var vsum0 = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
+        var vsum1 = vsum0;
+        var vaMagnitude0 = vsum0;
+        var vaMagnitude1 = vsum0;
+        var vbMagnitude0 = vsum0;
+        var vbMagnitude1 = vsum0;
+
+        int i = 0;
+        for (; i + 2 * step <= vectorizedLength; i += 2 * step) {
+            var a0 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i);
+            var b0 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i);
+            var a1 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i + step);
+            var b1 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i + step);
+            vsum0 = a0.fma(b0, vsum0);
+            vsum1 = a1.fma(b1, vsum1);
+            vaMagnitude0 = a0.fma(a0, vaMagnitude0);
+            vaMagnitude1 = a1.fma(a1, vaMagnitude1);
+            vbMagnitude0 = b0.fma(b0, vbMagnitude0);
+            vbMagnitude1 = b1.fma(b1, vbMagnitude1);
+        }
+        for (; i < vectorizedLength; i += step) {
+            var a = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i);
+            var b = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i);
+            vsum0 = a.fma(b, vsum0);
+            vaMagnitude0 = a.fma(a, vaMagnitude0);
+            vbMagnitude0 = b.fma(b, vbMagnitude0);
+        }
+
+        float sum = vsum0.add(vsum1).reduceLanes(VectorOperators.ADD);
+        float aMagnitude = vaMagnitude0.add(vaMagnitude1).reduceLanes(VectorOperators.ADD);
+        float bMagnitude = vbMagnitude0.add(vbMagnitude1).reduceLanes(VectorOperators.ADD);
+
+        for (; i < length; i++) {
             sum += v1.get(v1offset + i) * v2.get(v2offset + i);
             aMagnitude += v1.get(v1offset + i) * v1.get(v1offset + i);
             bMagnitude += v2.get(v2offset + i) * v2.get(v2offset + i);
@@ -550,6 +613,9 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
         if (length == FloatVector.SPECIES_PREFERRED.length())
             return squareDistancePreferred(v1, v1offset, v2, v2offset);
 
+        if (length >= UNROLL_MIN_LENGTH)
+            return squareDistanceUnrolled(v1, v1offset, v2, v2offset, length);
+
         final int vectorizedLength = FloatVector.SPECIES_PREFERRED.loopBound(length);
         FloatVector sum = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
 
@@ -565,6 +631,45 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
         float res = sum.reduceLanes(VectorOperators.ADD);
 
         // Process the tail
+        for (; i < length; ++i) {
+            var diff = v1.get(v1offset + i) - v2.get(v2offset + i);
+            res += diff * diff;
+        }
+
+        return res;
+    }
+
+    /**
+     * Two-way unrolled variant of {@link #squareDistancePreferred(VectorFloat, int, VectorFloat, int, int)} for long
+     * vectors. A single accumulator is a serial FMA dependency chain, which leaves the load/FMA ports idle whenever
+     * the vectors are cache-resident (same reasoning as {@link #dotProductPreferred}).
+     */
+    private float squareDistanceUnrolled(VectorFloat<?> v1, int v1offset, VectorFloat<?> v2, int v2offset, int length) {
+        final int step = FloatVector.SPECIES_PREFERRED.length();
+        final int vectorizedLength = FloatVector.SPECIES_PREFERRED.loopBound(length);
+        FloatVector sum0 = FloatVector.zero(FloatVector.SPECIES_PREFERRED);
+        FloatVector sum1 = sum0;
+
+        int i = 0;
+        for (; i + 2 * step <= vectorizedLength; i += 2 * step) {
+            FloatVector a0 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i);
+            FloatVector b0 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i);
+            FloatVector a1 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i + step);
+            FloatVector b1 = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i + step);
+            var d0 = a0.sub(b0);
+            var d1 = a1.sub(b1);
+            sum0 = d0.fma(d0, sum0);
+            sum1 = d1.fma(d1, sum1);
+        }
+        for (; i < vectorizedLength; i += step) {
+            FloatVector a = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v1, v1offset + i);
+            FloatVector b = fromVectorFloat(FloatVector.SPECIES_PREFERRED, v2, v2offset + i);
+            var diff = a.sub(b);
+            sum0 = diff.fma(diff, sum0);
+        }
+
+        float res = sum0.add(sum1).reduceLanes(VectorOperators.ADD);
+
         for (; i < length; ++i) {
             var diff = v1.get(v1offset + i) - v2.get(v2offset + i);
             res += diff * diff;

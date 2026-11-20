@@ -60,6 +60,37 @@ public class TestVectorizationProvider extends RandomizedTest {
         Assert.assertEquals(a.getVectorUtilSupport().squareDistance(v1a, v2a), b.getVectorUtilSupport().squareDistance(v1b, v2b), 0.0001f);
     }
 
+    /**
+     * cosine and squareDistance switch to unrolled kernels at a minimum length; check lengths on both sides of the
+     * switch, plus lengths that leave every combination of unrolled-loop remainder and scalar tail.
+     */
+    @Test
+    public void testSimilarityMetricsAcrossUnrollThreshold() {
+        Assume.assumeTrue(hasSimd);
+
+        VectorizationProvider scalar = new DefaultVectorizationProvider();
+        VectorizationProvider simd = VectorizationProvider.getInstance();
+
+        for (int length : new int[] {1, 7, 64, 127, 128, 191, 192, 193, 199, 200, 255, 256, 257, 385, 1024, 1536, 4099}) {
+            VectorFloat<?> simdA = TestUtil.randomVector(getRandom(), length);
+            VectorFloat<?> simdB = TestUtil.randomVector(getRandom(), length);
+            var scalarA = scalar.getVectorTypeSupport().createFloatVector(length);
+            var scalarB = scalar.getVectorTypeSupport().createFloatVector(length);
+            for (int i = 0; i < length; i++) {
+                scalarA.set(i, simdA.get(i));
+                scalarB.set(i, simdB.get(i));
+            }
+
+            String msg = "length=" + length;
+            float cosineTolerance = 1e-5f;
+            float distanceTolerance = Math.max(1e-4f, scalar.getVectorUtilSupport().squareDistance(scalarA, scalarB) * 1e-5f);
+            Assert.assertEquals(msg, scalar.getVectorUtilSupport().cosine(scalarA, scalarB), simd.getVectorUtilSupport().cosine(simdA, simdB), cosineTolerance);
+            Assert.assertEquals(msg, scalar.getVectorUtilSupport().cosine(scalarA, 0, scalarB, 0, length), simd.getVectorUtilSupport().cosine(simdA, 0, simdB, 0, length), cosineTolerance);
+            Assert.assertEquals(msg, scalar.getVectorUtilSupport().squareDistance(scalarA, scalarB), simd.getVectorUtilSupport().squareDistance(simdA, simdB), distanceTolerance);
+            Assert.assertEquals(msg, scalar.getVectorUtilSupport().squareDistance(scalarA, 0, scalarB, 0, length), simd.getVectorUtilSupport().squareDistance(simdA, 0, simdB, 0, length), distanceTolerance);
+        }
+    }
+
     @Test
     public void testAssembleAndSum() {
         Assume.assumeTrue(hasSimd);
